@@ -79,10 +79,9 @@ def filter_bboxes_with_point_cloud(bboxes, point_cloud):
                 point_count += 1
         if point_count >= 15:  # Assuming a threshold of 15 points to consider the bbox valid
             filtered_bboxes_indices.append((i, point_count))
-    print(filtered_bboxes_indices)
     return filtered_bboxes_indices
     
-def generate_labels(frame, pose, point_cloud):
+def generate_labels(frame, point_cloud, extrinsic_matrix, pose):
     obj_name, difficulty, dimensions, locations, heading_angles = [], [], [], [], []
     tracking_difficulty, speeds, accelerations, obj_ids = [], [], [], []
     num_points_in_gt = []
@@ -345,7 +344,7 @@ def process_single_sequence(sequence_file, save_path, sampled_interval, has_labe
 
 
         if has_label:
-            annotations = generate_labels(frame, pose=pose, point_cloud)
+            annotations = generate_labels(frame, point_cloud, extrinsic_matrix, pose=pose)
             info['annos'] = annotations
     
         info['num_points_of_each_lidar'] = num_points_of_each_lidar

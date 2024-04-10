@@ -11,7 +11,7 @@ from ...utils import common_utils
 import tensorflow as tf
 from waymo_open_dataset.utils import frame_utils, transform_utils, range_image_utils
 from waymo_open_dataset import dataset_pb2
-
+from waymo_open_dataset.label_pb2 import Label
 try:
     tf.enable_eager_execution()
 except:
@@ -19,14 +19,88 @@ except:
 
 WAYMO_CLASSES = ['unknown', 'Vehicle', 'Pedestrian', 'Sign', 'Cyclist']
 
+def transform_bbox_waymo(label: Label) -> np.ndarray:
+    """Transform object's 3D bounding box using Waymo utils"""
+    heading = -label.box.heading
+    bbox_corners = get_bbox(label)
+ 
+    mat = transform_utils.get_yaw_rotation(heading)
+    rot_mat = mat.numpy()[:2, :2]
+ 
+    return bbox_corners @ rot_mat
+ 
+def get_bbox(label: Label) -> np.ndarray:
+    width, length = label.box.width, label.box.length
+    return np.array([[-0.5 * length, -0.5 * width],
+                     [-0.5 * length, 0.5 * width],
+                     [0.5 * length, -0.5 * width],
+                     [0.5 * length, 0.5 * width]])
 
-def generate_labels(frame, pose):
+def transform_point_homogeneous(p: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    """Transform a 3D point using a 4x4 transformation matrix."""
+    p_homogeneous = np.hstack((p, [1]))
+    p_transformed = transform @ p_homogeneous
+    return p_transformed[:3]
+
+def build_open3d_bbox_extrinsic(box: np.ndarray, label: Label, extrinsic_matrix: np.ndarray) -> list:
+    """Create bounding box's points and lines needed for drawing in open3d, including extrinsic transformation."""
+    x, y, z = label.box.center_x, label.box.center_y, label.box.center_z
+    z_bottom = z - label.box.height / 2
+    z_top = z + label.box.height / 2
+
+    transformed_points = []
+    for idx in range(box.shape[0]):
+        # Apply original transformation to get bottom and top points
+        bottom_point = np.array([x + box[idx, 0], y + box[idx, 1], z_bottom])
+        top_point = np.array([x + box[idx, 0], y + box[idx, 1], z_top])
+        
+        # Transform points with extrinsic matrix
+        bottom_point_transformed = transform_point_homogeneous(bottom_point, extrinsic_matrix)
+        top_point_transformed = transform_point_homogeneous(top_point, extrinsic_matrix)
+        
+        transformed_points.extend([bottom_point_transformed, top_point_transformed])
+
+    return transformed_points
+
+def is_point_inside_bbox(point, bbox_min, bbox_max):
+    """Check if a point is inside the bounding box."""
+    return np.all(point >= bbox_min) and np.all(point <= bbox_max)
+
+def filter_bboxes_with_point_cloud(bboxes, point_cloud):
+    """Filters bounding boxes to keep those that have at least one point from the point cloud within them."""
+    filtered_bboxes_indices = []
+    for i, bbox in enumerate(bboxes):
+        bbox_points = np.array(bbox)
+        bbox_min = bbox_points.min(axis=0)
+        bbox_max = bbox_points.max(axis=0)
+        point_count = 0
+        for point in point_cloud:
+            if is_point_inside_bbox(point, bbox_min, bbox_max):
+                point_count += 1
+        if point_count >= 15:  # Assuming a threshold of 15 points to consider the bbox valid
+            filtered_bboxes_indices.append((i, point_count))
+    print(filtered_bboxes_indices)
+    return filtered_bboxes_indices
+    
+def generate_labels(frame, pose, point_cloud):
     obj_name, difficulty, dimensions, locations, heading_angles = [], [], [], [], []
     tracking_difficulty, speeds, accelerations, obj_ids = [], [], [], []
     num_points_in_gt = []
     laser_labels = frame.laser_labels
 
-    for i in range(len(laser_labels)):
+    bboxes = []
+    for label in laser_labels:
+        bbox_corners = transform_bbox_waymo(label)
+        bbox_points = build_open3d_bbox_extrinsic(bbox_corners, label, extrinsic_matrix)      
+        bboxes.append(bbox_points)
+
+    filtered_bboxes_info = filter_bboxes_with_point_cloud(bboxes, point_cloud)
+    filtered_bboxes_indices  = [info[0] for info in filtered_bboxes_info]
+    num_of_lidar_pts = [info[1] for info in filtered_bboxes_info]
+
+
+    j = 0
+    for i in filtered_bboxes_indices:
         box = laser_labels[i].box
         class_ind = laser_labels[i].type
         loc = [box.center_x, box.center_y, box.center_z]
@@ -37,7 +111,8 @@ def generate_labels(frame, pose):
         dimensions.append([box.length, box.width, box.height])  # lwh in unified coordinate of OpenPCDet
         locations.append(loc)
         obj_ids.append(laser_labels[i].id)
-        num_points_in_gt.append(laser_labels[i].num_lidar_points_in_box)
+        num_points_in_gt.append(num_of_lidar_pts[j])
+        j += 1 
         speeds.append([laser_labels[i].metadata.speed_x, laser_labels[i].metadata.speed_y])
         accelerations.append([laser_labels[i].metadata.accel_x, laser_labels[i].metadata.accel_y])
 
@@ -166,7 +241,7 @@ def convert_range_image_to_point_cloud(frame, range_images, camera_projections, 
     return points, cp_points, points_NLZ, points_intensity, points_elongation
 
 
-def save_lidar_points(frame, cur_save_path, use_two_returns=True):
+def save_lidar_points(frame, cur_save_path, extrinsic_matrix, use_two_returns=True, fov_min_angle=120, fov_max_angle=170):
     ret_outputs = frame_utils.parse_range_image_and_camera_projection(frame)
     if len(ret_outputs) == 4:
         range_images, camera_projections, seg_labels, range_image_top_pose = ret_outputs
@@ -184,15 +259,29 @@ def save_lidar_points(frame, cur_save_path, use_two_returns=True):
     points_intensity = np.concatenate(points_intensity, axis=0).reshape(-1, 1)
     points_elongation = np.concatenate(points_elongation, axis=0).reshape(-1, 1)
 
-    num_points_of_each_lidar = [point.shape[0] for point in points]
+    # Apply the extrinsic transformation if provided
+    point_cloud_homogeneous = np.hstack((points_all, np.ones((points_all.shape[0], 1))))
+    transformed_points = point_cloud_homogeneous @ extrinsic_matrix.T
+    
+    # Calculate azimuth angles (in degrees)
+    azimuth_angles = np.degrees(np.arctan2(transformed_points[:, 1], transformed_points[:, 0]))
+    
+    # Filter for the specified FoV
+    fov_filter = (azimuth_angles >= fov_min_angle) & (azimuth_angles <= fov_max_angle)
+    points_all = transformed_points[fov_filter, :-1]  # Exclude the homogeneous coordinate
+    points_in_NLZ_flag = points_in_NLZ_flag[fov_filter]
+    points_intensity = points_intensity[fov_filter]
+    points_elongation = points_elongation[fov_filter]
+
+    num_points_of_each_lidar = points_all.shape[0]
+    # Concatenate filtered points with their intensity, elongation, and NLZ flag
     save_points = np.concatenate([
         points_all, points_intensity, points_elongation, points_in_NLZ_flag
     ], axis=-1).astype(np.float32)
 
     np.save(cur_save_path, save_points)
     # print('saving to ', cur_save_path)
-    return num_points_of_each_lidar
-
+    return [num_points_of_each_lidar], points_all  # Since the points are now filtered, return the count of filtered points
 
 def process_single_sequence(sequence_file, save_path, sampled_interval, has_label=True, use_two_returns=True, update_info_only=False):
     sequence_name = os.path.splitext(os.path.basename(sequence_file))[0]
@@ -225,6 +314,8 @@ def process_single_sequence(sequence_file, save_path, sampled_interval, has_labe
         frame = dataset_pb2.Frame()
         frame.ParseFromString(bytearray(data.numpy()))
 
+        extrinsic_matrix = np.array(frame.context.laser_calibrations[4].extrinsic.transform, dtype=np.float32).reshape(4,4)
+        
         info = {}
         pc_info = {'num_features': 5, 'lidar_sequence': sequence_name, 'sample_idx': cnt}
         info['point_cloud'] = pc_info
@@ -244,17 +335,19 @@ def process_single_sequence(sequence_file, save_path, sampled_interval, has_labe
         pose = np.array(frame.pose.transform, dtype=np.float32).reshape(4, 4)
         info['pose'] = pose
 
-        if has_label:
-            annotations = generate_labels(frame, pose=pose)
-            info['annos'] = annotations
-
         if update_info_only and sequence_infos_old is not None:
             assert info['frame_id'] == sequence_infos_old[cnt]['frame_id']
             num_points_of_each_lidar = sequence_infos_old[cnt]['num_points_of_each_lidar']
         else:
-            num_points_of_each_lidar = save_lidar_points(
-                frame, cur_save_dir / ('%04d.npy' % cnt), use_two_returns=use_two_returns
+            num_points_of_each_lidar, point_cloud = save_lidar_points(
+                frame, cur_save_dir / ('%04d.npy' % cnt), extrinsic_matrix, use_two_returns=use_two_returns
             )
+
+
+        if has_label:
+            annotations = generate_labels(frame, pose=pose, point_cloud)
+            info['annos'] = annotations
+    
         info['num_points_of_each_lidar'] = num_points_of_each_lidar
 
         sequence_infos.append(info)

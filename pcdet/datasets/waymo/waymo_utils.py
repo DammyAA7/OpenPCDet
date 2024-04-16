@@ -272,7 +272,7 @@ def save_lidar_points(frame, cur_save_path, extrinsic_matrix, use_two_returns=Tr
     points_intensity = points_intensity[fov_filter]
     points_elongation = points_elongation[fov_filter]
 
-    num_points_of_each_lidar = [point.shape[0] for point in points]
+    num_points_of_each_lidar = points_all.shape[0]
     # Concatenate filtered points with their intensity, elongation, and NLZ flag
     save_points = np.concatenate([
         points_all, points_intensity, points_elongation, points_in_NLZ_flag

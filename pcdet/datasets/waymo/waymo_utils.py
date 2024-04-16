@@ -272,7 +272,7 @@ def save_lidar_points(frame, cur_save_path, extrinsic_matrix, use_two_returns=Tr
     points_intensity = points_intensity[fov_filter]
     points_elongation = points_elongation[fov_filter]
 
-    num_points_of_each_lidar = points_all.shape[0]
+    num_points_of_each_lidar = [point.shape[0] for point in points]
     # Concatenate filtered points with their intensity, elongation, and NLZ flag
     save_points = np.concatenate([
         points_all, points_intensity, points_elongation, points_in_NLZ_flag
@@ -280,7 +280,7 @@ def save_lidar_points(frame, cur_save_path, extrinsic_matrix, use_two_returns=Tr
 
     np.save(cur_save_path, save_points)
     # print('saving to ', cur_save_path)
-    return [num_points_of_each_lidar], points_all  # Since the points are now filtered, return the count of filtered points
+    return num_points_of_each_lidar, points_all  # Since the points are now filtered, return the count of filtered points
 
 def process_single_sequence(sequence_file, save_path, sampled_interval, has_label=True, use_two_returns=True, update_info_only=False):
     sequence_name = os.path.splitext(os.path.basename(sequence_file))[0]

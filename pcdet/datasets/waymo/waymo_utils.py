@@ -77,7 +77,7 @@ def filter_bboxes_with_point_cloud(bboxes, point_cloud):
         for point in point_cloud:
             if is_point_inside_bbox(point, bbox_min, bbox_max):
                 point_count += 1
-        if point_count >= 15:  # Assuming a threshold of 15 points to consider the bbox valid
+        if point_count >= 5:  # Assuming a threshold of 15 points to consider the bbox valid
             filtered_bboxes_indices.append((i, point_count))
     return filtered_bboxes_indices
     

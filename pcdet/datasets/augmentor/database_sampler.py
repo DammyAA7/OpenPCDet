@@ -129,19 +129,25 @@ class DataBaseSampler(object):
 
     def sample_with_fixed_number(self, class_name, sample_group):
         """
+        Sample a fixed number of database samples from a specified class.
+        
         Args:
-            class_name:
-            sample_group:
+            class_name (str): Class name for which to sample.
+            sample_group (dict): Contains the sample configuration.
+            
         Returns:
-
+            list: List of sampled data dictionaries, empty if none could be sampled.
         """
         sample_num, pointer, indices = int(sample_group['sample_num']), sample_group['pointer'], sample_group['indices']
         if pointer >= len(self.db_infos[class_name]):
+            if len(self.db_infos[class_name]) == 0:
+                return []  # Return an empty list if no samples available.
             indices = np.random.permutation(len(self.db_infos[class_name]))
             pointer = 0
 
-        sampled_dict = [self.db_infos[class_name][idx] for idx in indices[pointer: pointer + sample_num]]
-        pointer += sample_num
+        sampled_end = pointer + sample_num
+        sampled_dict = self.db_infos[class_name][pointer: min(sampled_end, len(self.db_infos[class_name]))]
+        pointer = sampled_end if sampled_end < len(self.db_infos[class_name]) else 0
         sample_group['pointer'] = pointer
         sample_group['indices'] = indices
         return sampled_dict
@@ -443,14 +449,6 @@ class DataBaseSampler(object):
         return data_dict
 
     def __call__(self, data_dict):
-        """
-        Args:
-            data_dict:
-                gt_boxes: (N, 7 + C) [x, y, z, dx, dy, dz, heading, ...]
-
-        Returns:
-
-        """
         gt_boxes = data_dict['gt_boxes']
         gt_names = data_dict['gt_names'].astype(str)
         existed_boxes = gt_boxes
@@ -460,19 +458,17 @@ class DataBaseSampler(object):
 
         for class_name, sample_group in self.sample_groups.items():
             if self.limit_whole_scene:
-                num_gt = np.sum(class_name == gt_names)
+                num_gt = np.sum(gt_names == class_name)
                 sample_group['sample_num'] = str(int(self.sample_class_num[class_name]) - num_gt)
             if int(sample_group['sample_num']) > 0:
                 sampled_dict = self.sample_with_fixed_number(class_name, sample_group)
+                if not sampled_dict:  # Skip if no samples were returned.
+                    continue
 
                 sampled_boxes = np.stack([x['box3d_lidar'] for x in sampled_dict], axis=0).astype(np.float32)
-
-                assert not self.sampler_cfg.get('DATABASE_WITH_FAKELIDAR', False), 'Please use latest codes to generate GT_DATABASE'
-
                 iou1 = iou3d_nms_utils.boxes_bev_iou_cpu(sampled_boxes[:, 0:7], existed_boxes[:, 0:7])
                 iou2 = iou3d_nms_utils.boxes_bev_iou_cpu(sampled_boxes[:, 0:7], sampled_boxes[:, 0:7])
-                iou2[range(sampled_boxes.shape[0]), range(sampled_boxes.shape[0])] = 0
-                iou1 = iou1 if iou1.shape[1] > 0 else iou2
+                iou2[np.diag_indices_from(iou2)] = 0
                 valid_mask = ((iou1.max(axis=1) + iou2.max(axis=1)) == 0)
 
                 if self.img_aug_type is not None:
@@ -490,13 +486,14 @@ class DataBaseSampler(object):
 
         sampled_gt_boxes = existed_boxes[gt_boxes.shape[0]:, :]
 
-        if total_valid_sampled_dict.__len__() > 0:
-            sampled_gt_boxes2d = np.concatenate(sampled_gt_boxes2d, axis=0) if len(sampled_gt_boxes2d) > 0 else None
-            sampled_mv_height = np.concatenate(sampled_mv_height, axis=0) if len(sampled_mv_height) > 0 else None
+        if total_valid_sampled_dict:
+            sampled_gt_boxes2d = np.concatenate(sampled_gt_boxes2d, axis=0) if sampled_gt_boxes2d else None
+            sampled_mv_height = np.concatenate(sampled_mv_height, axis=0) if sampled_mv_height else None
 
             data_dict = self.add_sampled_boxes_to_scene(
                 data_dict, sampled_gt_boxes, total_valid_sampled_dict, sampled_mv_height, sampled_gt_boxes2d
             )
 
-        data_dict.pop('gt_boxes_mask')
+        if 'gt_boxes_mask' in data_dict:
+            data_dict.pop('gt_boxes_mask')
         return data_dict
